@@ -29,10 +29,36 @@ from ibis.backends.base import Database
 from ibis.backends.base.sql import BaseSQLBackend
 from ibis.backends.sqlite.compiler import SQLiteCompiler
 
+from ibis_substrait.compiler.core import SubstraitCompiler
+from ibis_substrait.compiler.translate import translate
+from ibis_substrait.proto.substrait import algebra_pb2 as stalg
+
+import ibis.expr.operations.relations as rel
+from ibis.expr import rules as rlz
+class FileTable(rel.DatabaseTable):
+    files = rlz.value_list_of(rlz.string)
+
+
+@translate.register(FileTable)
+def _file_table(op, expr, compiler, **kwargs):
+    return stalg.Rel(
+        read=stalg.ReadRel(
+            # TODO: filter,
+            # TODO: projection,
+            base_schema=translate(op.schema),
+            local_files=stalg.ReadRel.LocalFiles(items=[
+                # TODO: this definitely is wrong
+                stalg.ReadRel.LocalFiles.FileOrFiles(uri_path=path._arg.value, parquet=stalg.ReadRel.LocalFiles.FileOrFiles.ParquetReadOptions())
+                for path in op.files
+            ]),
+        )
+    )
+    raise NotImplementedError
+
 
 class Backend(BaseSQLBackend):
     name = 'adbc'
-    compiler = SQLiteCompiler
+    compiler = SubstraitCompiler()
     database_class = Database
 
     def __getstate__(self) -> dict:
@@ -50,6 +76,26 @@ class Backend(BaseSQLBackend):
             driver=driver, entrypoint=entrypoint, **kwargs
         )
         self._conn = adbc_driver_manager.AdbcConnection(self._db)
+
+    def file_table(self, name: str, schema: sch.Schema | pa.Schema, files: list[str]):
+        if isinstance(schema, pa.Schema):
+            schema = pa_dt.infer_pyarrow_schema(schema)
+        return self.table_expr_class(FileTable(name=name, schema=schema, files=files, source=self))
+
+    def compile(self, expr, params=None, limit='default', timecontext=None):
+        plan = self.compiler.compile(expr)
+        plan.ClearField("extension_uris") # acero doesn't like this
+        # acero doesn't like this either
+        plan.relations[0].rel.CopyFrom(plan.relations[0].root.input)
+        return plan
+
+    def execute(self, expr, params=None, limit='default', **kwargs):
+        plan = self.compile(expr)
+        reader = self.raw_substrait(plan)
+        try:
+            return reader.reader.read_pandas()
+        finally:
+            reader.close()
 
     def create_table(
         self,
@@ -99,7 +145,7 @@ class Backend(BaseSQLBackend):
 
         if isinstance(expr, ir.Table):
             raise NotImplementedError(
-                'Creating tables from an expression is ' 'not yet implemented'
+                'Creating tables from an expression is not yet implemented'
             )
         if expr is None:
             pyarrow_schema = pa.schema(
@@ -189,9 +235,23 @@ class Backend(BaseSQLBackend):
     def raw_sql(self, query: str) -> Any:
         query = str(query)  # TODO: annotation for sqlalchemy
         print(query)
+        # TODO: implement context manager if not already
+        stmt = adbc_driver_manager.AdbcStatement(self._conn)
         try:
-            stmt = adbc_driver_manager.AdbcStatement(self._conn)
             stmt.set_sql_query(query)
+            stmt.execute()
+            handle = stmt.get_stream()
+            reader = pa.RecordBatchReader._import_from_c(handle.address)
+        except Exception:
+            stmt.close()
+            raise
+        return _StatementReader(stmt, reader)
+
+    def raw_substrait(self, plan) -> Any:
+        plan_bytes = plan.SerializeToString()
+        stmt = adbc_driver_manager.AdbcStatement(self._conn)
+        try:
+            stmt.set_substrait_plan(plan_bytes)
             stmt.execute()
             handle = stmt.get_stream()
             reader = pa.RecordBatchReader._import_from_c(handle.address)
